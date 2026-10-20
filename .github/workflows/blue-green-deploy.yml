@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       color:
-        description: "Version to deploy"
+        description: "Color slot to deploy"
         required: true
         type: choice
         options:
@@ -15,12 +15,7 @@ on:
         description: "Application version label"
         required: true
         type: string
-        default: "1.0"
-      switch_traffic:
-        description: "Route the public service to this color"
-        required: true
-        type: boolean
-        default: false
+        default: "2.0"
 
 permissions:
   contents: read
@@ -35,45 +30,67 @@ env:
 
 jobs:
   deploy:
-    name: Deploy and smoke test
+    name: Deploy, preview and validate
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out source code
+      - name: 1 - Check out source
         uses: actions/checkout@v4
 
-      - name: Authenticate to Google Cloud
+      - name: 2 - Validate deployment inputs
+        env:
+          COLOR: ${{ inputs.color }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$COLOR" != "blue" && "$COLOR" != "green" ]]; then
+            echo "Invalid color."
+            exit 1
+          fi
+
+          if [[ ! "$VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Invalid version label."
+            exit 1
+          fi
+
+          echo "Target slot: $COLOR"
+          echo "Application version: $VERSION"
+
+      - name: 3 - Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
-      - name: Set up Google Cloud CLI
+      - name: 4 - Set up Google Cloud CLI and GKE plugin
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
           install_components: gke-gcloud-auth-plugin
 
-      - name: Configure Docker authentication
+      - name: 5 - Configure Docker authentication
         run: |
           gcloud auth configure-docker \
             "${GCP_REGION}-docker.pkg.dev" --quiet
 
-      - name: Build and push image
-        env:
-          IMAGE_URI: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPOSITORY }}/gke-blue-green-demo
+      - name: 6 - Build and push versioned image
         run: |
-          docker build -t "${IMAGE_URI}:${GITHUB_SHA}" .
-          docker push "${IMAGE_URI}:${GITHUB_SHA}"
-          echo "IMAGE_URI=${IMAGE_URI}:${GITHUB_SHA}" >> "$GITHUB_ENV"
+          IMAGE_URI="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/gke-blue-green-demo:${GITHUB_SHA}"
 
-      - name: Connect to GKE
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+          echo "Container image: $IMAGE_URI"
+
+      - name: 7 - Connect to GKE
         run: |
           gcloud container clusters get-credentials "$GKE_CLUSTER" \
             --region "$GKE_LOCATION" \
             --project "$GCP_PROJECT_ID"
 
-      - name: Deploy selected color
+          echo "Connected to GKE cluster: $GKE_CLUSTER"
+
+      - name: 8 - Deploy selected color and internal Service
         env:
           COLOR: ${{ inputs.color }}
           VERSION: ${{ inputs.version }}
@@ -137,13 +154,83 @@ jobs:
           kubectl rollout status "deployment/${DEPLOYMENT}" \
             --timeout=300s
 
-      - name: Smoke test selected color inside the cluster
+          echo "Deployment is ready: ${DEPLOYMENT}"
+          echo "Internal URL: http://${DEPLOYMENT}:5000/"
+          echo "Internal health URL: http://${DEPLOYMENT}:5000/health"
+
+      - name: 9 - Point preview endpoint to selected color
+        env:
+          COLOR: ${{ inputs.color }}
+        run: |
+          kubectl apply -f - <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: gke-blue-green-preview
+          spec:
+            type: LoadBalancer
+            selector:
+              app: gke-blue-green-demo
+              color: ${COLOR}
+            ports:
+              - name: http
+                port: 80
+                targetPort: 5000
+          EOF
+
+          echo "Preview endpoint is configured for ${COLOR}."
+          echo "Production traffic has NOT been changed."
+
+      - name: 10 - Wait for preview URL
+        id: preview
+        run: |
+          for attempt in $(seq 1 60); do
+            PREVIEW_IP=$(kubectl get service gke-blue-green-preview \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+            if [[ -n "$PREVIEW_IP" ]]; then
+              echo "preview_ip=$PREVIEW_IP" >> "$GITHUB_OUTPUT"
+              echo "Preview homepage: http://${PREVIEW_IP}/"
+              echo "Preview health:   http://${PREVIEW_IP}/health"
+
+              PROD_IP=$(kubectl get service eks-web-app-service \
+                -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+              echo "Current production homepage: http://${PROD_IP}/"
+              echo "Current production health:   http://${PROD_IP}/health"
+              break
+            fi
+
+            echo "Waiting for preview IP (attempt ${attempt}/60)..."
+            sleep 10
+          done
+
+          if [[ -z "${PREVIEW_IP:-}" ]]; then
+            echo "Preview IP was not assigned within 10 minutes."
+            exit 1
+          fi
+
+          {
+            echo "## Blue-Green Deployment"
+            echo ""
+            echo "- Target slot: **${{ inputs.color }}**"
+            echo "- Version: **${{ inputs.version }}**"
+            echo "- Image: \`${IMAGE_URI}\`"
+            echo ""
+            echo "### Preview endpoint"
+            echo "- Homepage: http://${PREVIEW_IP}/"
+            echo "- Health: http://${PREVIEW_IP}/health"
+            echo ""
+            echo "Production traffic has not been switched yet."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 11 - Test selected color inside GKE
         env:
           COLOR: ${{ inputs.color }}
           VERSION: ${{ inputs.version }}
         run: |
-          DEPLOYMENT="gke-blue-green-${COLOR}"
-          
+          echo "Internal homepage: http://gke-blue-green-${COLOR}:5000/"
+          echo "Internal health:   http://gke-blue-green-${COLOR}:5000/health"
 
           kubectl run "smoke-${GITHUB_RUN_ID}" \
             --rm -i --restart=Never \
@@ -156,54 +243,135 @@ jobs:
             echo "$result"
             echo "$result" | grep -F "\"color\":\"${EXPECTED_COLOR}\""
             echo "$result" | grep -F "\"version\":\"${EXPECTED_VERSION}\""'
-            
 
-      - name: Switch public traffic when explicitly requested
-        if: ${{ inputs.switch_traffic }}
-        env:
-          COLOR: ${{ inputs.color }}
-        run: |
-          echo "Switching eks-web-app-service to ${COLOR}"
-
-          kubectl patch service eks-web-app-service \
-            --type=merge \
-            -p "{\"spec\":{\"selector\":{\"app\":\"gke-blue-green-demo\",\"color\":\"${COLOR}\"}}}"
-
-          kubectl rollout status \
-            "deployment/gke-blue-green-${COLOR}" \
-            --timeout=300s
-
-      - name: Smoke test public endpoint
-        if: ${{ inputs.switch_traffic }}
+      - name: 12 - Test Green or Blue preview in browser-facing endpoint
         env:
           COLOR: ${{ inputs.color }}
           VERSION: ${{ inputs.version }}
+          PREVIEW_IP: ${{ steps.preview.outputs.preview_ip }}
         run: |
-          EXTERNAL_IP=$(kubectl get service eks-web-app-service \
-            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-
-          if [ -z "$EXTERNAL_IP" ]; then
-            echo "The public service has no external IP."
-            exit 1
-          fi
-
-          echo "Testing http://${EXTERNAL_IP}/health"
+          echo "Preview homepage: http://${PREVIEW_IP}/"
+          echo "Preview health:   http://${PREVIEW_IP}/health"
 
           for attempt in $(seq 1 18); do
-            if RESPONSE=$(curl -fsS \
-              --max-time 5 \
-              "http://${EXTERNAL_IP}/health"); then
-              echo "$RESPONSE"
+            RESPONSE=$(curl -fsS --max-time 5 \
+              "http://${PREVIEW_IP}/health") || true
 
-              if echo "$RESPONSE" | grep -Fq "\"color\":\"${COLOR}\"" &&
-                 echo "$RESPONSE" | grep -Fq "\"version\":\"${VERSION}\""; then
-                echo "Public smoke test passed."
-                exit 0
-              fi
+            echo "Attempt ${attempt}: ${RESPONSE:-waiting for response}"
+
+            if echo "$RESPONSE" | grep -Fq "\"color\":\"${COLOR}\"" &&
+               echo "$RESPONSE" | grep -Fq "\"version\":\"${VERSION}\""; then
+              echo "Preview validation PASSED."
+              exit 0
             fi
 
             sleep 5
           done
 
-          echo "Public smoke test failed."
+          echo "Preview validation FAILED. Production was not changed."
+          exit 1
+
+  promote:
+    name: Approve and switch production traffic
+    runs-on: ubuntu-latest
+    needs: deploy
+
+    # GitHub waits for the required reviewer before this job starts.
+    environment: production
+
+    steps:
+      - name: 1 - Check out source
+        uses: actions/checkout@v4
+
+      - name: 2 - Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: 3 - Set up Google Cloud CLI and GKE plugin
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          install_components: gke-gcloud-auth-plugin
+
+      - name: 4 - Connect to GKE
+        run: |
+          gcloud container clusters get-credentials "$GKE_CLUSTER" \
+            --region "$GKE_LOCATION" \
+            --project "$GCP_PROJECT_ID"
+
+      - name: 5 - Switch production traffic and verify
+        env:
+          COLOR: ${{ inputs.color }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          PROD_IP=$(kubectl get service eks-web-app-service \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+          PREVIEW_IP=$(kubectl get service gke-blue-green-preview \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+          if [[ -z "$PROD_IP" || -z "$PREVIEW_IP" ]]; then
+            echo "Production or preview IP is missing."
+            exit 1
+          fi
+
+          OLD_SELECTOR=$(kubectl get service eks-web-app-service \
+            -o json | jq -c '.spec.selector')
+
+          if [[ -z "$OLD_SELECTOR" || "$OLD_SELECTOR" == "null" ]]; then
+            echo "Could not read the current production selector."
+            exit 1
+          fi
+
+          echo "Approved target: ${COLOR} v${VERSION}"
+          echo "Preview homepage: http://${PREVIEW_IP}/"
+          echo "Preview health:   http://${PREVIEW_IP}/health"
+          echo "Production homepage: http://${PROD_IP}/"
+          echo "Production health:   http://${PROD_IP}/health"
+          echo "Switching production traffic now."
+
+          kubectl patch service eks-web-app-service \
+            --type=merge \
+            -p "{\"spec\":{\"selector\":{\"app\":\"gke-blue-green-demo\",\"color\":\"${COLOR}\"}}}"
+
+          for attempt in $(seq 1 18); do
+            RESPONSE=$(curl -fsS --max-time 5 \
+              "http://${PROD_IP}/health") || true
+
+            echo "Production check ${attempt}: ${RESPONSE:-waiting}"
+
+            if echo "$RESPONSE" | grep -Fq "\"color\":\"${COLOR}\"" &&
+               echo "$RESPONSE" | grep -Fq "\"version\":\"${VERSION}\""; then
+              echo "Production validation PASSED."
+
+              {
+                echo ""
+                echo "### Production promotion successful"
+                echo "- Live color: **${COLOR}**"
+                echo "- Live version: **${VERSION}**"
+                echo "- Homepage: http://${PROD_IP}/"
+                echo "- Health: http://${PROD_IP}/health"
+                echo "- Preview: http://${PREVIEW_IP}/"
+              } >> "$GITHUB_STEP_SUMMARY"
+
+              echo "LIVE HOMEPAGE: http://${PROD_IP}/"
+              echo "LIVE HEALTH:   http://${PROD_IP}/health"
+              echo "PREVIEW URL:   http://${PREVIEW_IP}/"
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "Production validation failed. Restoring the previous selector."
+
+          kubectl patch service eks-web-app-service \
+            --type=merge \
+            -p "{\"spec\":{\"selector\":${OLD_SELECTOR}}}"
+
+          echo "Previous production selector restored."
           exit 1
