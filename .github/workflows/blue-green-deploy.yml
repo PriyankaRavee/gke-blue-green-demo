@@ -1,0 +1,204 @@
+
+name: Blue-Green Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      color:
+        description: "Version to deploy"
+        required: true
+        type: choice
+        options:
+          - blue
+          - green
+      version:
+        description: "Application version label"
+        required: true
+        type: string
+        default: "1.0"
+      switch_traffic:
+        description: "Route the public service to this color"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION }}
+  GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+  GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+  AR_REPOSITORY: ${{ vars.AR_REPOSITORY }}
+
+jobs:
+  deploy:
+    name: Deploy and smoke test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker authentication
+        run: |
+          gcloud auth configure-docker \
+            "${GCP_REGION}-docker.pkg.dev" --quiet
+
+      - name: Build and push image
+        env:
+          IMAGE_URI: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPOSITORY }}/gke-blue-green-demo
+        run: |
+          docker build -t "${IMAGE_URI}:${GITHUB_SHA}" .
+          docker push "${IMAGE_URI}:${GITHUB_SHA}"
+          echo "IMAGE_URI=${IMAGE_URI}:${GITHUB_SHA}" >> "$GITHUB_ENV"
+
+      - name: Connect to GKE
+        run: |
+          gcloud container clusters get-credentials "$GKE_CLUSTER" \
+            --region "$GKE_LOCATION" \
+            --project "$GCP_PROJECT_ID"
+
+      - name: Deploy selected color
+        env:
+          COLOR: ${{ inputs.color }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          DEPLOYMENT="gke-blue-green-${COLOR}"
+
+          kubectl apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${DEPLOYMENT}
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: gke-blue-green-demo
+                color: ${COLOR}
+            template:
+              metadata:
+                labels:
+                  app: gke-blue-green-demo
+                  color: ${COLOR}
+              spec:
+                containers:
+                  - name: app
+                    image: ${IMAGE_URI}
+                    ports:
+                      - containerPort: 5000
+                    env:
+                      - name: APP_COLOR
+                        value: "${COLOR}"
+                      - name: APP_VERSION
+                        value: "${VERSION}"
+                    readinessProbe:
+                      httpGet:
+                        path: /health
+                        port: 5000
+                      initialDelaySeconds: 3
+                      periodSeconds: 5
+                    livenessProbe:
+                      httpGet:
+                        path: /health
+                        port: 5000
+                      initialDelaySeconds: 10
+                      periodSeconds: 10
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${DEPLOYMENT}
+          spec:
+            type: ClusterIP
+            selector:
+              app: gke-blue-green-demo
+              color: ${COLOR}
+            ports:
+              - port: 5000
+                targetPort: 5000
+          EOF
+
+          kubectl rollout status "deployment/${DEPLOYMENT}" \
+            --timeout=300s
+
+      - name: Smoke test selected color inside the cluster
+        env:
+          COLOR: ${{ inputs.color }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          DEPLOYMENT="gke-blue-green-${COLOR}"
+          SERVICE_URL="http://${DEPLOYMENT}:5000"
+
+          kubectl run "smoke-${GITHUB_RUN_ID}" \
+            --rm -i --restart=Never \
+            --image=curlimages/curl:8.12.1 \
+            --command -- sh -c "
+              set -e
+              result=\$(curl -fsS '${SERVICE_URL}/health')
+              echo \"\$result\"
+              echo \"\$result\" | grep -F '\"color\":\"${COLOR}\"'
+              echo \"\$result\" | grep -F '\"version\":\"${VERSION}\"'
+            "
+
+      - name: Switch public traffic when explicitly requested
+        if: ${{ inputs.switch_traffic }}
+        env:
+          COLOR: ${{ inputs.color }}
+        run: |
+          echo "Switching eks-web-app-service to ${COLOR}"
+
+          kubectl patch service eks-web-app-service \
+            --type=merge \
+            -p "{\"spec\":{\"selector\":{\"app\":\"gke-blue-green-demo\",\"color\":\"${COLOR}\"}}}"
+
+          kubectl rollout status \
+            "deployment/gke-blue-green-${COLOR}" \
+            --timeout=300s
+
+      - name: Smoke test public endpoint
+        if: ${{ inputs.switch_traffic }}
+        env:
+          COLOR: ${{ inputs.color }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          EXTERNAL_IP=$(kubectl get service eks-web-app-service \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+          if [ -z "$EXTERNAL_IP" ]; then
+            echo "The public service has no external IP."
+            exit 1
+          fi
+
+          echo "Testing http://${EXTERNAL_IP}/health"
+
+          for attempt in $(seq 1 18); do
+            if RESPONSE=$(curl -fsS \
+              --max-time 5 \
+              "http://${EXTERNAL_IP}/health"); then
+              echo "$RESPONSE"
+
+              if echo "$RESPONSE" | grep -Fq "\"color\":\"${COLOR}\"" &&
+                 echo "$RESPONSE" | grep -Fq "\"version\":\"${VERSION}\""; then
+                echo "Public smoke test passed."
+                exit 0
+              fi
+            fi
+
+            sleep 5
+          done
+
+          echo "Public smoke test failed."
+          exit 1
