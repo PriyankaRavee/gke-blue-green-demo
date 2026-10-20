@@ -140,17 +140,19 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           DEPLOYMENT="gke-blue-green-${COLOR}"
-          SERVICE_URL="http://${DEPLOYMENT}:5000"
+          
 
           kubectl run "smoke-${GITHUB_RUN_ID}" \
             --rm -i --restart=Never \
             --image=curlimages/curl:8.12.1 \
-            --command -- sh -c "
-              set -e
-              result=\$(curl -fsS '${SERVICE_URL}/health')
-              echo \"\$result\"
-              echo \"\$result\" | grep -F '\"color\":\"${COLOR}\"'
-              echo \"\$result\" | grep -F '\"version\":\"${VERSION}\"'
+            --env="EXPECTED_COLOR=${COLOR}" \
+            --env="EXPECTED_VERSION=${VERSION}" \
+            --command -- sh -c \
+            'set -e
+            result=$(curl -fsS "http://gke-blue-green-${EXPECTED_COLOR}:5000/health")
+            echo "$result"
+            echo "$result" | grep -F "\"color\":\"${EXPECTED_COLOR}\""
+            echo "$result" | grep -F "\"version\":\"${EXPECTED_VERSION}\""'
             "
 
       - name: Switch public traffic when explicitly requested
