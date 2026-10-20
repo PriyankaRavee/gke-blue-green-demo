@@ -153,7 +153,7 @@ jobs:
             echo "$result"
             echo "$result" | grep -F "\"color\":\"${EXPECTED_COLOR}\""
             echo "$result" | grep -F "\"version\":\"${EXPECTED_VERSION}\""'
-            "
+            
 
       - name: Switch public traffic when explicitly requested
         if: ${{ inputs.switch_traffic }}
