@@ -89,6 +89,30 @@ jobs:
             --project "$GCP_PROJECT_ID"
 
           echo "Connected to GKE cluster: $GKE_CLUSTER"
+	
+      - name: 7A - Ensure target is not the live production slot
+        env:
+          COLOR: ${{ inputs.color }}
+        run: |
+          PROD_IP=$(kubectl get service eks-web-app-service \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+          LIVE_COLOR=$(kubectl get service eks-web-app-service \
+            -o jsonpath='{.spec.selector.color}')
+
+          echo "Current production homepage: http://${PROD_IP}/"
+          echo "Current production health:   http://${PROD_IP}/health"
+          echo "Current live color: ${LIVE_COLOR:-original application}"
+          echo "Requested deployment slot: ${COLOR}"
+
+          if [[ -n "$LIVE_COLOR" && "$LIVE_COLOR" == "$COLOR" ]]; then
+            echo "ERROR: ${COLOR} is currently serving production."
+            echo "Deploy to the inactive color slot instead."
+            exit 1
+          fi
+
+          echo "Safety check passed. Target slot is not currently live."
+
 
       - name: 8 - Deploy selected color and internal Service
         env:
